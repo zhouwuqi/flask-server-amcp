@@ -1,0 +1,7 @@
+openai
+flask
+dotenv
+requests
+tiktoken
+gevent
+gunicorn
