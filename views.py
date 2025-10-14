@@ -7,20 +7,67 @@ import string
 import json
 import threading
 
-
 blueprint = Blueprint('tools', __name__)
+
+
+# 向特定服务器发送json
+def post_json(url, info, headers=None, timeout=30):
+    try:
+        default_headers = {"Content-Type": "application/json"}
+        if headers:
+            default_headers.update(headers)
+        response = requests.post(url, json=info, headers=default_headers, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise Exception(f"POST请求失败: {str(e)}")
+
+
+
+# ----------------------------------------------------------------
+# 接受来自agentplus的文件传输的sample
+@blueprint.route('/amcp/receive_file', methods=['POST'])
+def sample_receive_file():
+    data = request.get_json()
+    params = data["params"] # 在agentplus中设置的固定输入值
+    args = data["args"] # 来自agentplus的会话信息
+    input = data["input"] # agent的输入
+
+    # -------------------
+    # 接受一个文件的fileid
+    file_url = input["file_url"]
+    print(file_url)
+    # 你的逻辑代码,读取文件,进行操作等....
+    # .....
+    # -------------------
+
+    try:
+        # 返回成功响应和文件名
+        return jsonify({
+            "statusCode": 1, 
+            "returnData":{
+                "params":params,
+                "input":input,
+                "args":args
+            }
+        })
+    except Exception as e:
+        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+
+
 
 
 
 
 # ----------------------------------------------------------------
+# 接受来自agentplus的普通调用
 @blueprint.route('/amcp/sync', methods=['POST'])
 def sample_sync():
-    # 异步调用sample用法
+
     data = request.get_json()
     params = data["params"] # 在agentplus中设置的固定输入值
     args = data["args"] # 来自agentplus的会话信息
-    input = data["input"] # llm的输入值 -> Dict
+    input = data["input"] # agent的输入
 
     # -------------------
     # 你的代码...
@@ -45,28 +92,14 @@ def sample_sync():
 
 
 # ----------------------------------------------------------------
+# 接受来自agentplus的异步调用sample用法
 @blueprint.route('/amcp/async', methods=['POST'])
 def sample_async():
-    # 异步调用sample用法
 
     data = request.get_json()
     params = data["params"] # 在agentplus中设置的固定输入值
     args = data["args"] # 来自agentplus的会话信息
-    input = data["input"] # block的输入值
-
-
-    def post_json(url, info, headers=None, timeout=30):
-        try:
-            default_headers = {"Content-Type": "application/json"}
-            if headers:
-                default_headers.update(headers)
-            response = requests.post(url, json=info, headers=default_headers, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            raise Exception(f"POST请求失败: {str(e)}")
-
-
+    input = data["input"] # agent的输入
 
     
     started_time = time.strftime("%Y-%m-%d %H:%M:%S")

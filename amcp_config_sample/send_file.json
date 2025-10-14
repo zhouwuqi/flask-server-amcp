@@ -1,0 +1,23 @@
+{
+  "url": "http://1.2.3.4:3400/amcp/receive_file",
+  "function":{
+    "name": "test_send_file",
+    "description": "send file to amcp",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "fileid": {
+          "type": "string",
+          "description": "file's ID"
+        }
+      }
+    }
+  },
+  "frontend":{
+    "title":"test send file",
+    "tips":"a sample amcp for sending file to your server."
+  },
+  "params": {
+    "password": "....."
+  }
+}

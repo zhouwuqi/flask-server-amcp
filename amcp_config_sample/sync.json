@@ -1,0 +1,28 @@
+{
+  "url": "http://1.2.3.4:3400/amcp/sync",
+  "function":{
+    "name": "test_tool_sync",
+    "description": "for test,input sample_id and sample_name.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "sample_id": {
+          "type": "number",
+          "description": "input a number"
+        },
+        "sample_name": {
+          "type": "string",
+          "description": "input a string"
+        }
+      }
+    }
+  },
+  "frontend":{
+    "title":"a testing sync tool",
+    "tips":"tell users what your tool can do."
+  },
+  "params": {
+    "parm_1": "parm_1_1_1"
+  }
+}
+

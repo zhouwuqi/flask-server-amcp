@@ -2,11 +2,11 @@
 
 
 # 计算工作进程数（假设有4个CPU核心）
-NUM_WORKERS=$((2 * $(nproc) + 1))
+NUM_WORKERS=1
 
 # 使用 Gunicorn 启动 Flask 应用，增加 timeout 和 workers 参数
 gunicorn main:app \
-    --bind 0.0.0.0:3300 \
+    --bind 0.0.0.0:3400 \
     --workers $NUM_WORKERS \
     --worker-class gevent \
     --timeout 600 \
