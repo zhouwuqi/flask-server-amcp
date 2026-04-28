@@ -10,6 +10,10 @@ AMCP 是一套用于与 AgentPlus 平台通信的标准协议，允许开发者�
 2. **处理同步调用请求** (`/amcp/sync`)
 3. **支持异步任务处理** (`/amcp/async`)
 
+并额外提供一个工具自描述端点：
+
+4. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
+
 所有请求均遵循统一的数据格式封装：
 ```json
 {

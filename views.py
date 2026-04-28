@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 import os
-import requests  
+import requests
 import time
 import random
 import string
@@ -8,6 +8,46 @@ import json
 import threading
 
 blueprint = Blueprint('tools', __name__)
+
+
+# ----------------------------------------------------------------
+# 暴露 amcp_config_sample/ 下的所有 JSON 配置,让 agentplus 端能"按 URL 自动获取描述",
+# 不再需要用户手动复制粘贴 JSON。
+#
+# 返回结构:
+#   { "tools": [ { "id": "<filename>", "config": {...} }, ... ] }
+#
+# CORS:开放 *,因为前端浏览器会直接来拉(避免再走 agentplus 服务端代理)。
+@blueprint.route('/amcp/manifest', methods=['GET', 'OPTIONS'])
+def sample_manifest():
+    if request.method == 'OPTIONS':
+        resp = jsonify({})
+        resp.headers.add("Access-Control-Allow-Origin", "*")
+        resp.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        resp.headers.add("Access-Control-Allow-Headers", "Content-Type")
+        return resp
+
+    config_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amcp_config_sample")
+    tools = []
+    try:
+        if os.path.isdir(config_dir):
+            for filename in sorted(os.listdir(config_dir)):
+                if not filename.endswith(".json"):
+                    continue
+                tool_id = filename[:-5]
+                try:
+                    with open(os.path.join(config_dir, filename), "r", encoding="utf-8") as f:
+                        config = json.load(f)
+                    tools.append({"id": tool_id, "config": config})
+                except Exception:
+                    # 单个坏文件不影响其他工具被列出
+                    continue
+        resp = jsonify({"statusCode": 1, "tools": tools})
+    except Exception as e:
+        resp = jsonify({"statusCode": 0, "message": f"Error: {str(e)}"})
+
+    resp.headers.add("Access-Control-Allow-Origin", "*")
+    return resp
 
 
 # 向特定服务器发送json
