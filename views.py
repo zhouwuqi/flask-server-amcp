@@ -132,6 +132,59 @@ def sample_sync():
 
 
 # ----------------------------------------------------------------
+# 把一个文件一次性写进【调用用户】的 temp 缓存区(落在 amcp/outer/ 下)。
+#
+# 用 args 里自带的一次性 token: write_temp_file_token
+#   - 文件最终路径: 用户文件夹/amcp/outer/<你决定的 path>
+#     path 可含多级子目录(如 "reports/2026/out.json"),后端逐段做白名单校验,
+#     '..' 之类的穿越会被拒。
+#   - 用户能在 /cms/temp 页面看到 / 下载; 若该 agent 开了沙盒 mount_user_temp,
+#     沙盒里 /cache/amcp/outer/... 也能读到。
+#   - 内容用 base64 编码提交。限制: 单文件 <=100MB,且不超用户 temp 总配额(1GB)。
+#   - 一次性: 该 token 用一次即失效,一次出站只能写一个文件。
+#   - 安全: 不要传 userid / chatid —— 后端从 token 反查,防止越权写到别人的 temp。
+@blueprint.route('/amcp/write_temp_file', methods=['POST'])
+def sample_write_temp_file():
+    import base64
+
+    data = request.get_json()
+    params = data["params"]   # 在agentplus中设置的固定输入值
+    args = data["args"]       # 来自agentplus的会话信息(含一次性 token)
+    input = data["input"]     # agent的输入
+
+    try:
+        token = args.get("write_temp_file_token")
+        if not token:
+            return jsonify({"statusCode": 0, "message": "missing write_temp_file_token"}), 400
+
+        # LLM 决定的相对路径 + 内容(实际可换成你服务生成的任意文件字节)
+        path = input.get("path") or "amcp_demo.txt"
+        content = input.get("content") or "hello from external amcp"
+        data_bytes = content.encode("utf-8")
+
+        # 提交到 agentplus: 文件会落在 用户文件夹/amcp/outer/<path>
+        url = "https://server.agentplus.cloud/back/api/write_temp_file"
+        info = {
+            "token": token,
+            "path": path,                                              # 由外部 AMCP 决定
+            "content_base64": base64.b64encode(data_bytes).decode("ascii"),
+        }
+        # resp 形如 {"statusCode":1,"returnData":{"relpath":"amcp/outer/<path>","size":N}}
+        # 失败 statusCode: 8=token无效或已用 / 400=参数错 / 413=超配额或文件过大
+        resp = post_json(url, info)
+
+        return jsonify({
+            "statusCode": 1,
+            "returnData": {
+                "write_result": resp,
+                "input": input
+            }
+        })
+    except Exception as e:
+        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+
+
+# ----------------------------------------------------------------
 # 接受来自agentplus的异步调用sample用法
 @blueprint.route('/amcp/async', methods=['POST'])
 def sample_async():

@@ -5,14 +5,15 @@ AMCP 是一套用于与 AgentPlus 平台通信的标准协议，允许开发者�
 
 ## 一、核心组件概述
 
-本示例代码展示了三种典型的 AMCP 使用场景：
+本示例代码展示了四种典型的 AMCP 使用场景：
 1. **接收文件传输请求** (`/amcp/receive_file`)
 2. **处理同步调用请求** (`/amcp/sync`)
 3. **支持异步任务处理** (`/amcp/async`)
+4. **写文件进用户 temp 缓存区** (`/amcp/write_temp_file`)
 
 并额外提供一个工具自描述端点：
 
-4. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
+5. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
 
 所有请求均遵循统一的数据格式封装：
 ```json
@@ -166,6 +167,63 @@ def async_task(messageid, args, input):
               ↓ 启动后台线程处理任务
               ↓ 完成后调用 update_async_message 更新状态
           <-- 返回初步接受信号 --
+```
+
+---
+
+### 步骤6：实现 `/amcp/write_temp_file` 接口（写文件进用户 temp）
+
+用 `args` 里自带的一次性 token `write_temp_file_token`，把一个文件写进**调用用户**的
+temp 缓存区。文件最终落在 `用户文件夹/amcp/outer/<你决定的 path>` 下，用户能在
+`/cms/temp` 页面查看 / 下载；若该 agent 开启了沙盒 `mount_user_temp`，沙盒里
+`/cache/amcp/outer/...` 也能读到。
+
+```python
+@blueprint.route('/amcp/write_temp_file', methods=['POST'])
+def sample_write_temp_file():
+    import base64
+    data = request.get_json()
+    args = data["args"]; input = data["input"]
+
+    token = args["write_temp_file_token"]          # 一次性,用完即焚
+    path = input.get("path", "result.txt")          # 由你决定,可含子目录
+    data_bytes = input.get("content", "").encode("utf-8")
+
+    info = {
+        "token": token,
+        "path": path,                               # 落在 amcp/outer/<path>
+        "content_base64": base64.b64encode(data_bytes).decode("ascii"),
+    }
+    resp = post_json("https://server.agentplus.cloud/back/api/write_temp_file", info)
+    return jsonify({"statusCode": 1, "returnData": {"write_result": resp}})
+```
+
+请求体（你发给 agentplus 的）：
+
+```json
+{
+    "token": "<write_temp_file_token>",
+    "path": "reports/result.txt",
+    "content_base64": "..."
+}
+```
+
+返回：`{ "statusCode": 1, "returnData": { "relpath": "amcp/outer/reports/result.txt", "size": 123 } }`
+
+要点：
+- **path 由你决定**，可含多级子目录;后端逐段白名单校验，`..` 穿越会被拒。
+- **不要传 userid / chatid** —— 后端从 token 反查，防止越权写到别人的 temp。
+- 限制：单文件 ≤100MB，不超用户 temp 总配额（1GB）。
+- 一次性：token 用一次即失效，**一次出站只能写一个文件**。
+- 失败 `statusCode`：8=token 无效或已用 / 400=参数错 / 413=超配额或文件过大。
+
+#### 写文件流程图：
+```
+[AgentPlus] -- args.write_temp_file_token --> [Your Server]
+              ↓ 你生成文件字节 + base64 编码
+              ↓ POST /back/api/write_temp_file {token, path, content_base64}
+          <-- {relpath, size} --  文件落在 用户文件夹/amcp/outer/<path>
+                                  (用户在 /cms/temp 可见)
 ```
 
 ---
