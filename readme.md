@@ -5,15 +5,16 @@ AMCP 是一套用于与 AgentPlus 平台通信的标准协议，允许开发者�
 
 ## 一、核心组件概述
 
-本示例代码展示了四种典型的 AMCP 使用场景：
+本示例代码展示了五种典型的 AMCP 使用场景：
 1. **接收文件传输请求** (`/amcp/receive_file`)
 2. **处理同步调用请求** (`/amcp/sync`)
 3. **支持异步任务处理** (`/amcp/async`)
 4. **写文件进用户 temp 缓存区** (`/amcp/write_temp_file`)
+5. **写文件进用户笔记本(struct)** (`/amcp/write_struct_file`)
 
 并额外提供一个工具自描述端点：
 
-5. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
+6. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
 
 所有请求均遵循统一的数据格式封装：
 ```json
@@ -224,6 +225,71 @@ def sample_write_temp_file():
               ↓ POST /back/api/write_temp_file {token, path, content_base64}
           <-- {relpath, size} --  文件落在 用户文件夹/amcp/outer/<path>
                                   (用户在 /cms/temp 可见)
+```
+
+---
+
+### 步骤7：实现 `/amcp/write_struct_file` 接口（写文件进用户笔记本 struct）
+
+把一个文件写进**调用用户**的结构化笔记本(struct)某页，作为一个 **file block** 落地
+(字节上传云存储后出公开 URL)。与 `write_temp_file` 的关键差异是它属于**细粒度授权**：
+
+> ⚠️ 用的 token `write_struct_file_token` 是 **按需下发** 的——只有当「发起本次调用的那个
+> LLM block 此刻确实有 struct 写权限」(在 agentplus 里勾了 `accessStructs` 且允许新增 block)
+> 时，它才会出现在 `args` 里。所以代码必须先判断它在不在，不在就说明本块没被授予笔记本写权限。
+
+```python
+@blueprint.route('/amcp/write_struct_file', methods=['POST'])
+def sample_write_struct_file():
+    import base64
+    data = request.get_json()
+    args = data["args"]; input = data["input"]
+
+    token = args.get("write_struct_file_token")   # 按需下发,不在=本块无笔记本写权限
+    if not token:
+        return jsonify({"statusCode": 0, "message": "no struct write permission on this block"}), 400
+
+    filename = input.get("filename", "result.txt")
+    data_bytes = input.get("content", "").encode("utf-8")
+
+    info = {
+        "token": token,
+        "filename": filename,
+        "content_base64": base64.b64encode(data_bytes).decode("ascii"),
+        # "pageid": input.get("pageid"),          # 可选,不传=写进笔记本根页
+        # "block_order_index": input.get("idx"),  # 可选,不传=追加到页尾
+    }
+    resp = post_json("https://server.agentplus.cloud/back/api/write_struct_file", info)
+    return jsonify({"statusCode": 1, "returnData": {"write_result": resp}})
+```
+
+请求体（你发给 agentplus 的）：
+
+```json
+{
+    "token": "<write_struct_file_token>",
+    "filename": "result.txt",
+    "content_base64": "..."
+}
+```
+
+返回：`{ "statusCode": 1, "returnData": { "contentid": 123, "pageid": 456, "file_url": "https://...", "filename": "result.txt" } }`
+
+要点：
+- **token 按需下发**：`args` 里没有 `write_struct_file_token` 就代表本块没被授予笔记本写权限，直接报错给 LLM 让它知道要去开 `accessStructs`。
+- **作用域被冻结**：后端只允许写进该 block 被授权的笔记本范围(`root_page` + `editable_path`)。不传 `pageid` → 默认写进该笔记本根页；传别的笔记本 / 越界的 `pageid` 一律 **403**。
+- **不要传 userid / chatid** —— 后端从 token 反查，防止越权写到别人的笔记本。
+- 限制：单文件 ≤100MB。
+- 一次性：token 用一次即失效，**一次出站只能写一个文件**。
+- 失败 `statusCode`：8=token 无效或已用 / 400=参数错 / **403=目标页越出作用域** / 413=文件过大。
+
+#### 写笔记本文件流程图：
+```
+[AgentPlus] -- args.write_struct_file_token(按需下发) --> [Your Server]
+              ↓ 你生成文件字节 + base64 编码
+              ↓ POST /back/api/write_struct_file {token, filename, content_base64, pageid?}
+          <-- {contentid, pageid, file_url} --  文件作为 file block 落在用户笔记本页
+                                                (作用域被冻结在授权的 root_page/editable_path 内)
 ```
 
 ---

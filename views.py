@@ -185,6 +185,71 @@ def sample_write_temp_file():
 
 
 # ----------------------------------------------------------------
+# 把一个文件一次性写进【调用用户】的结构化笔记本(struct)指定页,作为一个 file block 落地。
+#
+# 用 args 里【按需下发】的一次性 token: write_struct_file_token
+#   —— 与 write_temp_file_token 的关键差异: 这是【细粒度授权】。
+#      该 token 只在「发起本次调用的那个 LLM block 此刻确实有 struct 写权限」
+#      (在 agentplus 里勾了 accessStructs 且允许新增 block)时才会出现在 args 里。
+#      所以代码里必须先判断它在不在 —— 不在就说明本块没被授予笔记本写权限。
+#
+#   - 文件落地形态: 笔记本某页上新建一个 file block,字节上传云存储后出公开 URL。
+#   - 作用域被冻结: 后端只允许写进该 block 被授权的笔记本范围(root_page + editable_path)。
+#     不传 pageid → 默认写进该笔记本根页; 传了别的笔记本 / 越界的 pageid 一律被拒(403)。
+#   - 内容用 base64 编码提交。限制: 单文件 <=100MB。
+#   - 一次性: 该 token 用一次即失效,一次出站只能写一个文件。
+#   - 安全: 不要传 userid / chatid —— 后端从 token 反查,防止越权写到别人的笔记本。
+@blueprint.route('/amcp/write_struct_file', methods=['POST'])
+def sample_write_struct_file():
+    import base64
+
+    data = request.get_json()
+    params = data["params"]   # 在agentplus中设置的固定输入值
+    args = data["args"]       # 来自agentplus的会话信息(struct 写 token 按需下发)
+    input = data["input"]     # agent的输入
+
+    try:
+        # 按需下发: 发起块没勾 accessStructs 写权限时,args 里【不会】有这个 token
+        token = args.get("write_struct_file_token")
+        if not token:
+            return jsonify({
+                "statusCode": 0,
+                "message": "no write_struct_file_token in args: the calling block has no notebook(struct) write permission. "
+                           "Enable 'accessStructs' (allow add block) on this block in agentplus."
+            }), 400
+
+        # LLM 决定的文件名 + 内容(实际可换成你服务生成的任意文件字节)
+        filename = input.get("filename") or "amcp_demo.txt"
+        content = input.get("content") or "hello from external amcp (struct file)"
+        data_bytes = content.encode("utf-8")
+
+        # 提交到 agentplus: 文件作为 file block 写进笔记本页
+        url = "https://server.agentplus.cloud/back/api/write_struct_file"
+        info = {
+            "token": token,
+            "filename": filename,
+            "content_base64": base64.b64encode(data_bytes).decode("ascii"),
+            # 可选: 不传则默认写进该笔记本根页; 传了必须落在 token 冻结的作用域内,否则 403
+            # "pageid": input.get("pageid"),
+            # 可选: block 在页内的顺序; 不传则追加到页尾
+            # "block_order_index": input.get("block_order_index"),
+        }
+        # resp 形如 {"statusCode":1,"returnData":{"contentid":N,"pageid":N,"file_url":"...","filename":"..."}}
+        # 失败 statusCode: 8=token无效或已用 / 400=参数错 / 403=目标页越出作用域 / 413=文件过大
+        resp = post_json(url, info)
+
+        return jsonify({
+            "statusCode": 1,
+            "returnData": {
+                "write_result": resp,
+                "input": input
+            }
+        })
+    except Exception as e:
+        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+
+
+# ----------------------------------------------------------------
 # 接受来自agentplus的异步调用sample用法
 @blueprint.route('/amcp/async', methods=['POST'])
 def sample_async():
