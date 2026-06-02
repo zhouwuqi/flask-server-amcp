@@ -1,0 +1,14 @@
+# --- secrets / local config ---
+.env
+.env.*
+!.env.example
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- logs ---
+*.log

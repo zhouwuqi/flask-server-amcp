@@ -11,6 +11,21 @@ blueprint = Blueprint('tools', __name__)
 
 
 # ----------------------------------------------------------------
+# AgentPlus 回调基地址 —— 所有回调(create/update async message、write temp/struct file)
+# 都拼在这个 base 上。默认走官方云端,可用环境变量 AGENTPLUS_BASE_URL 覆盖:
+#   - 自建/私有部署: AGENTPLUS_BASE_URL=https://your.agentplus.host
+#   - 本地联调:      AGENTPLUS_BASE_URL=http://127.0.0.1:1000
+# 支持从同目录 .env 读取(需 python-dotenv);没装 dotenv 也不影响,纯靠进程环境变量即可。
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+AGENTPLUS_BASE_URL = (os.environ.get("AGENTPLUS_BASE_URL") or "https://server.agentplus.cloud").rstrip("/")
+
+
+# ----------------------------------------------------------------
 # 暴露 amcp_config_sample/ 下的所有 JSON 配置,让 agentplus 端能"按 URL 自动获取描述",
 # 不再需要用户手动复制粘贴 JSON。
 #
@@ -163,7 +178,7 @@ def sample_write_temp_file():
         data_bytes = content.encode("utf-8")
 
         # 提交到 agentplus: 文件会落在 用户文件夹/amcp/outer/<path>
-        url = "https://server.agentplus.cloud/back/api/write_temp_file"
+        url = f"{AGENTPLUS_BASE_URL}/back/api/write_temp_file"
         info = {
             "token": token,
             "path": path,                                              # 由外部 AMCP 决定
@@ -224,7 +239,7 @@ def sample_write_struct_file():
         data_bytes = content.encode("utf-8")
 
         # 提交到 agentplus: 文件作为 file block 写进笔记本页
-        url = "https://server.agentplus.cloud/back/api/write_struct_file"
+        url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file"
         info = {
             "token": token,
             "filename": filename,
@@ -264,7 +279,7 @@ def sample_async():
     try:
         # -----------------------------------------
         # post a async message
-        url = "https://server.agentplus.cloud/back/api/create_async_message"
+        url = f"{AGENTPLUS_BASE_URL}/back/api/create_async_message"
         info = {
             "chatid":args["chatid"],
             "token":args["create_async_message_token"],
@@ -286,7 +301,7 @@ def sample_async():
         # -------------------------------------------------------------------------
 
         def async_task(messageid, args, input):
-            update_url = "https://server.agentplus.cloud/back/api/update_async_message"
+            update_url = f"{AGENTPLUS_BASE_URL}/back/api/update_async_message"
             try:
                 # 异步处理逻辑
                 # ----------------------------

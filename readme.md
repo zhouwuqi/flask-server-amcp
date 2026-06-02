@@ -39,6 +39,34 @@ blueprint = Blueprint('tools', __name__)
 
 该蓝图将被注册到主应用中以启用相关功能。
 
+#### 配置回调地址（AGENTPLUS_BASE_URL）
+
+所有回调（`create_async_message` / `update_async_message` / `write_temp_file` / `write_struct_file`）都拼在一个**基地址**上。默认走官方云端 `https://server.agentplus.cloud`，可用环境变量 `AGENTPLUS_BASE_URL` 覆盖——自建/私有部署或本地联调时改这一个变量即可，不必逐个改源码：
+
+```python
+import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()              # 可选:从同目录 .env 读取;没装 dotenv 也能用进程环境变量
+except Exception:
+    pass
+
+AGENTPLUS_BASE_URL = (os.environ.get("AGENTPLUS_BASE_URL") or "https://server.agentplus.cloud").rstrip("/")
+# 之后回调统一写成 f"{AGENTPLUS_BASE_URL}/back/api/xxx"
+```
+
+设置方式（任选其一）：
+
+```bash
+# 1) 进程环境变量
+export AGENTPLUS_BASE_URL=http://127.0.0.1:1000
+
+# 2) 同目录 .env 文件(复制 .env.example 改之)
+echo 'AGENTPLUS_BASE_URL=https://your.agentplus.host' > .env
+```
+
+> 注意：基地址只是**回调目的地**(你的服务往 AgentPlus 发 token 的地方)，和你这台 AMCP 服务自身监听的端口(`run.sh` 里的 3400)无关。
+
 ---
 
 ### 步骤2：通用辅助函数
