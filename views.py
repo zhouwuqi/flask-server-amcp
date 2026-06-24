@@ -265,6 +265,150 @@ def sample_write_struct_file():
 
 
 # ----------------------------------------------------------------
+# 【进阶案例】异步生成 + 写进笔记本【指定页】,并演示「不消费 token 的 pageid 预检」。
+#
+# 这是把前面几块拼起来的真实范式(ComfyUI 异步出图就是这么做的):
+#   (1) pageid 预检(fail-fast): 在做任何昂贵动作【之前】,先用一次【不消费 token】的
+#       调用确认目标 pageid 落在 token 冻结的笔记本作用域内 —— 越权立刻返回,绝不白跑
+#       后面的耗时任务。预检走 /back/api/write_struct_file/precheck,它【不会】消耗那个
+#       一次性的 write_struct_file_token(只读、可反复查)。
+#   (2) create_async_message: 先在聊天里建一张 running 卡片。
+#   (3) 后台线程做耗时活(这里 sleep 模拟),生成文件字节。
+#   (4) write_struct_file: 把文件写进【那一页】(带 pageid)。token 在这一步【才被消费】。
+#   (5) 卡片终态由写入结果决定: 成功→done(用 AP 回的公开 file_url); 若该页在预检之后
+#       被删/移走导致越权(403, TOCTOU)→ error,且仍把已生成的产物信息给出,避免成果丢失。
+#
+# 为什么要预检? write_struct_file_token 是【一次性写】(写一次即焚),不能"先试写一下看行
+# 不行"。预检端点把「查作用域」和「那一次写」拆开 —— 查 scope 是只读、幂等的,不该消耗那次
+# 写。任何外部 AMCP 在跑昂贵任务前都能复用这个预检来 fail-fast。
+@blueprint.route('/amcp/async_generate_to_struct', methods=['POST'])
+def sample_async_generate_to_struct():
+    import base64
+
+    data = request.get_json()
+    params = data["params"]   # 在agentplus中设置的固定输入值
+    args = data["args"]       # 来自agentplus的会话信息(struct 写 token 按需下发)
+    input = data["input"]     # agent的输入
+
+    started_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        # 按需下发的一次性写 token; 不在 = 本块没被授予笔记本写权限
+        struct_token = args.get("write_struct_file_token")
+        if not struct_token:
+            return jsonify({
+                "statusCode": 0,
+                "message": "no write_struct_file_token in args: the calling block has no notebook(struct) write permission. "
+                           "Enable 'accessStructs' (allow add block) on this block in agentplus."
+            }), 400
+
+        # 本案例写进【指定页】,所以要求 agent 传 pageid(用 accessStructs 工具浏览拿到)
+        pageid = input.get("pageid")
+        if pageid is None:
+            return jsonify({
+                "statusCode": 0,
+                "message": "missing input.pageid: use the accessStructs tool to pick a target page id."
+            }), 400
+
+        # ---- (1) pageid 预检: 不消费 token,越权 fail-fast,不白跑后面的耗时活 ----
+        precheck_url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file/precheck"
+        # 预检请求体只要 {token, pageid}; 不传 pageid 则按"默认根页"判定。
+        # 返回 {"statusCode":1,"returnData":{"in_scope":true,...}} = 在范围内;
+        #      越权 {"statusCode":403,"returnData":"<原因>"} / token 失效 {"statusCode":8}
+        pre = post_json(precheck_url, {"token": struct_token, "pageid": pageid})
+        if pre.get("statusCode") != 1:
+            return jsonify({
+                "statusCode": 0,
+                "message": f"pageid precheck failed: {pre.get('returnData')}",
+                "returnData": pre,
+            }), 400
+
+        # ---- (2) 建一张 running 卡片 ----
+        create_url = f"{AGENTPLUS_BASE_URL}/back/api/create_async_message"
+        created = post_json(create_url, {
+            "chatid": args["chatid"],
+            "token": args["create_async_message_token"],
+            "params": {
+                "title": "Generating + filing into notebook...",
+                "content": f"target pageid: {pageid}",
+                "status": "running",
+                "image_urls": [],
+                "additional_tags": {"started_time": started_time, "pageid": pageid},
+            },
+        })
+        messageid = created["returnData"]["messageid"]
+
+        # ---- (3)+(4)+(5) 后台: 耗时活 → 写指定页 → 卡片终态由写入结果决定 ----
+        def worker(messageid, args, input, struct_token, pageid):
+            update_url = f"{AGENTPLUS_BASE_URL}/back/api/update_async_message"
+            try:
+                # 你的耗时活(出图/渲染/转码...)。这里用 sleep + 一段文本模拟产物。
+                time.sleep(3)
+                filename = input.get("filename") or "amcp_demo.txt"
+                content = input.get("content") or "hello from external amcp (async -> struct)"
+                file_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+
+                # 写进【那一页】。token 在这一步【才被消费】(一次性)。
+                write_url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file"
+                wr = post_json(write_url, {
+                    "token": struct_token,
+                    "filename": filename,
+                    "content_base64": file_b64,
+                    "pageid": pageid,
+                })
+                rd = (wr or {}).get("returnData") or {}
+
+                if wr.get("statusCode") == 1:
+                    # 成功 → done,用 AP 回的公开 file_url 展示
+                    post_json(update_url, {
+                        "messageid": messageid,
+                        "token": args["update_async_message_token"],
+                        "params": {
+                            "title": "Done - filed into notebook",
+                            "content": "",
+                            "status": "done",
+                            "image_urls": [rd.get("file_url")] if rd.get("file_url") else [],
+                            "additional_tags": {
+                                "started_time": started_time,
+                                "processed_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "pageid": rd.get("pageid"),
+                                "contentid": rd.get("contentid"),
+                            },
+                        },
+                    })
+                else:
+                    # 极少数 TOCTOU: 预检通过后该页被删/移走 → 写时才 403(或 token 被抢用=8)。
+                    # 卡片翻 error,但仍把产物信息给出,避免成果丢失。
+                    post_json(update_url, {
+                        "messageid": messageid,
+                        "token": args["update_async_message_token"],
+                        "params": {
+                            "title": "Generated, but NOT filed (pageid rejected)",
+                            "content": f"write_struct_file rejected: statusCode={wr.get('statusCode')}, {wr.get('returnData')}",
+                            "status": "error",
+                            "additional_tags": {"pageid": pageid, "error": str(wr.get("returnData"))},
+                        },
+                    })
+            except Exception as e:
+                post_json(update_url, {
+                    "messageid": messageid,
+                    "token": args["update_async_message_token"],
+                    "params": {"title": "Failed", "status": "error", "content": f"error: {str(e)}"},
+                })
+
+        t = threading.Thread(target=worker, args=(messageid, args, input, struct_token, pageid))
+        t.daemon = True   # 守护线程,主线程结束时自动结束
+        t.start()
+
+        # 立刻返回"已开始"回执(异步: 图/文件完成后由后台线程回写卡片)
+        return jsonify({
+            "statusCode": 1,
+            "returnData": {"message": "started; will file the result into the chosen notebook page when done."}
+        })
+    except Exception as e:
+        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+
+
+# ----------------------------------------------------------------
 # 接受来自agentplus的异步调用sample用法
 @blueprint.route('/amcp/async', methods=['POST'])
 def sample_async():

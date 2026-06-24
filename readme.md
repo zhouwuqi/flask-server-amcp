@@ -5,16 +5,17 @@ AMCP 是一套用于与 AgentPlus 平台通信的标准协议，允许开发者�
 
 ## 一、核心组件概述
 
-本示例代码展示了五种典型的 AMCP 使用场景：
+本示例代码展示了六种典型的 AMCP 使用场景：
 1. **接收文件传输请求** (`/amcp/receive_file`)
 2. **处理同步调用请求** (`/amcp/sync`)
 3. **支持异步任务处理** (`/amcp/async`)
 4. **写文件进用户 temp 缓存区** (`/amcp/write_temp_file`)
 5. **写文件进用户笔记本(struct)** (`/amcp/write_struct_file`)
+6. **【进阶】异步生成 + 写进笔记本指定页(含 pageid 预检)** (`/amcp/async_generate_to_struct`)
 
 并额外提供一个工具自描述端点：
 
-6. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
+7. **manifest 自描述** (`GET /amcp/manifest`) — 把 `amcp_config_sample/` 下的所有 JSON 一次性吐出，让 AgentPlus 端可以按服务器 URL 自动拉取工具描述，不必再让用户手动粘贴 JSON。
 
 所有请求均遵循统一的数据格式封装：
 ```json
@@ -319,6 +320,58 @@ def sample_write_struct_file():
           <-- {contentid, pageid, file_url} --  文件作为 file block 落在用户笔记本页
                                                 (作用域被冻结在授权的 root_page/editable_path 内)
 ```
+
+---
+
+### 步骤8：进阶案例 —— 异步生成 + 写进笔记本【指定页】(含 pageid 预检)
+
+前面的 `write_struct_file` 演示了「把文件写进笔记本」，但有两个真实场景里很关键的点没覆盖：
+
+1. **写进 agent 选定的某一页**（而不只是根页）——把 `pageid` 一路带到 `write_struct_file`。
+2. **耗时任务先把 pageid 校验掉**——别等图都跑完了、写入时才发现 `pageid` 越权，白白浪费算力。
+
+第 2 点要靠一个**专门的预检端点**：
+
+#### `/back/api/write_struct_file/precheck` —— 不消费 token 的作用域预检
+
+它是 `write_struct_file` 的「dry-run / HEAD」版本：用**同一个** `write_struct_file_token`，回答「这个 `pageid` 在不在 token 冻结的笔记本作用域内」，但**绝不消耗**那一次性的写 token。
+
+```python
+precheck_url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file/precheck"
+pre = post_json(precheck_url, {"token": struct_token, "pageid": pageid})
+# 在范围内:  {"statusCode": 1, "returnData": {"in_scope": true, "root_page": ..., "pageid": ...}}
+# 越权:      {"statusCode": 403, "returnData": "<原因>"}
+# token失效: {"statusCode": 8,  "returnData": "invalid or used token"}
+if pre.get("statusCode") != 1:
+    return jsonify({"statusCode": 0, "message": f"pageid precheck failed: {pre.get('returnData')}"}), 400
+# ✅ 通过了再去做昂贵的活
+```
+
+> **为什么不直接写、让它失败就好？** 因为 `write_struct_file_token` 是**一次性写**（写一次即焚），没法「先试写一下看行不行」。预检把「查作用域」和「那一次写」拆开 —— 查 scope 是只读、幂等的，不该消耗那次写。**任何外部 AMCP** 在跑昂贵任务（出图、转码、长推理…）前都能复用这个预检来 fail-fast，这就是它作为通用原语的价值。
+
+#### 完整范式：预检 → 建卡片 → 后台干活 → 写指定页 → 卡片终态由写入结果决定
+
+`/amcp/async_generate_to_struct` 把异步、struct 写入、pageid 预检拼成一条龙（ComfyUI 异步出图就是这么做的）：
+
+```
+[AgentPlus] -- args.write_struct_file_token + input.pageid --> [Your Server]
+   (1) 预检 pageid(不消费 token)── 越权? ──是──> 立刻报错,不建卡片、不干活(零浪费)
+              │否
+   (2) create_async_message ─────────────────────> 聊天里出现一张 "running" 卡片
+   (3) 后台线程:做耗时活(出图/渲染/转码…),生成文件字节
+   (4) write_struct_file {token, filename, content_base64, pageid} ── token 此刻【才被消费】
+   (5) 卡片终态:
+         成功 → update_async_message status=done,用返回的公开 file_url 展示
+         越权(TOCTOU,预检后该页被删/移走)→ status=error + 说明,但仍把已生成的产物给出,避免成果丢失
+```
+
+要点：
+- **预检不消费 token**，真正的写才消费 —— 一次出站仍然只写一个文件。
+- **预检是优化、不是权威**：极少数情况下（预检通过后那一页被删/移走）写入时才 `403`。所以写入这一步要保留兜底——把卡片翻成 `error` 并把已生成的结果信息一并给出，别让成果丢失。
+- `pageid` 由 agent 经 `accessStructs` 工具浏览/新建目标页拿到；它必须属于被授权的笔记本且在可写路径内。
+- 失败 `statusCode` 与 `write_struct_file` 一致：8=token 无效或已用 / 403=目标页越出作用域 / 413=文件过大。
+
+> 这个端点用同一个 `write_struct_file_token`，所以**前提同样是**：发起块开启了 `accessStructs`（允许新增 block）写权限，否则 `args` 里根本没有这个 token。
 
 ---
 
