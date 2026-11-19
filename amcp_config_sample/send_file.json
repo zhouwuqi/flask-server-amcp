@@ -1,23 +1,26 @@
 {
-  "url": "http://1.2.3.4:3400/amcp/receive_file",
-  "function":{
+  "url": "/amcp/receive_file",
+  "function": {
     "name": "test_send_file",
-    "description": "send file to amcp",
+    "description": "把用户在聊天里发的一个文件交给示例服务,服务端下载后返回文件大小、类型和 sha256。",
     "parameters": {
       "type": "object",
       "properties": {
         "fileid": {
           "type": "string",
-          "description": "file's ID"
+          "description": "文件的 fileid,就是聊天消息里 <FILES_ATTACHMENT> 块给出的那个。只能用当前用户自己的文件。"
         }
-      }
+      },
+      "required": [
+        "fileid"
+      ]
     }
   },
-  "frontend":{
-    "title":"test send file",
-    "tips":"a sample amcp for sending file to your server."
+  "frontend": {
+    "title": "test send file",
+    "tips": "a sample tool that receives a file from the chat (fileid → file_url)."
   },
   "params": {
-    "password": "....."
+    "amcp_secret": ""
   }
 }

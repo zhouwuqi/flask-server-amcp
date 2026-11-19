@@ -1,8 +1,8 @@
 {
-  "url": "http://1.2.3.4:3400/amcp/write_struct_file",
-  "function":{
+  "url": "/amcp/write_struct_file",
+  "function": {
     "name": "test_write_struct_file",
-    "description": "把一个文件写进当前用户的笔记本(struct),作为一个 file block 落地。需在本块开启 accessStructs(允许新增 block)写权限,否则后端不会下发写 token。",
+    "description": "把一个文本文件作为文件块写进当前用户的笔记本。需要本 agent 有笔记本写权限(accessStructs 允许新增块),否则会返回错误。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -12,14 +12,24 @@
         },
         "content": {
           "type": "string",
-          "description": "要写入文件的文本内容"
+          "description": "文件的文本内容"
+        },
+        "pageid": {
+          "type": "integer",
+          "description": "可选。写进哪一页,用 accessStructs 工具查到;不填写进笔记本根页。"
         }
-      }
+      },
+      "required": [
+        "filename",
+        "content"
+      ]
     }
   },
-  "frontend":{
-    "title":"test write struct file",
-    "tips":"a sample amcp that writes a file as a file block into the caller's notebook(struct). requires this block's accessStructs write permission."
+  "frontend": {
+    "title": "test write notebook file",
+    "tips": "a sample tool that adds a file block to the caller's notebook. needs notebook write access."
   },
-  "params": {}
+  "params": {
+    "amcp_secret": ""
+  }
 }

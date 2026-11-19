@@ -1,0 +1,23 @@
+{
+  "url": "/amcp/async",
+  "function": {
+    "name": "test_tool_async",
+    "description": "示例异步工具:立刻返回「已开始」,几秒后结果以卡片形式出现在聊天里(卡片只给用户看,你看不到结果)。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "string",
+          "description": "随便一句描述,示例服务不使用它"
+        }
+      }
+    }
+  },
+  "frontend": {
+    "title": "test async",
+    "tips": "a sample async tool: returns at once, then posts the result as a card in the chat."
+  },
+  "params": {
+    "amcp_secret": ""
+  }
+}

@@ -1,518 +1,327 @@
-from flask import Blueprint, request, jsonify
-import os
-import requests
-import time
-import random
-import string
+"""示例 AMCP 端点。每个端点对应 AgentPlus 里的一个工具,配置在 amcp_config_sample/ 下。
+
+建议按这个顺序读:sync → receive_file → async → write_temp_file → write_struct_file
+→ async_generate_to_struct → return_image。协议说明见 readme.md,跟 AgentPlus
+打交道的细节都在 agentplus.py。
+"""
+import hashlib
 import json
+import logging
+import math
+import os
+import struct
 import threading
+import time
+import zlib
 
-blueprint = Blueprint('tools', __name__)
+import requests
+from flask import Blueprint, jsonify, request
+
+import agentplus as ap
+
+log = logging.getLogger("amcp")
+blueprint = Blueprint("amcp", __name__)
+
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amcp_config_sample")
+
+# 示例里「耗时的活」用 sleep 模拟,测试时改成 0
+SIMULATED_WORK_SECONDS = 3
+
+
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ----------------------------------------------------------------
-# AgentPlus 回调基地址 —— 所有回调(create/update async message、write temp/struct file)
-# 都拼在这个 base 上。默认走官方云端,可用环境变量 AGENTPLUS_BASE_URL 覆盖:
-#   - 自建/私有部署: AGENTPLUS_BASE_URL=https://your.agentplus.host
-#   - 本地联调:      AGENTPLUS_BASE_URL=http://127.0.0.1:1000
-# 支持从同目录 .env 读取(需 python-dotenv);没装 dotenv 也不影响,纯靠进程环境变量即可。
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-AGENTPLUS_BASE_URL = (os.environ.get("AGENTPLUS_BASE_URL") or "https://server.agentplus.cloud").rstrip("/")
-
-
-# ----------------------------------------------------------------
-# 暴露 amcp_config_sample/ 下的所有 JSON 配置,让 agentplus 端能"按 URL 自动获取描述",
-# 不再需要用户手动复制粘贴 JSON。
+# manifest:把 amcp_config_sample/ 下的工具配置一次性交给 AgentPlus。
+# 用户在 AgentPlus 的「设置 → A-MCP」里填本服务的地址,点拉取,就能选工具,
+# 不用手动复制粘贴 JSON。
 #
-# 返回结构:
-#   { "tools": [ { "id": "<filename>", "config": {...} }, ... ] }
-#
-# CORS:开放 *,因为前端浏览器会直接来拉(避免再走 agentplus 服务端代理)。
-@blueprint.route('/amcp/manifest', methods=['GET', 'OPTIONS'])
-def sample_manifest():
-    if request.method == 'OPTIONS':
+# - 是浏览器直接来拉,所以要开 CORS。AgentPlus 用 https 打开时,这里也必须是 https,
+#   否则浏览器会按「混合内容」拦掉。
+# - 配置里写相对路径的 url(如 "/amcp/sync"),这里会补成本服务的对外地址;
+#   写完整 URL 的保持原样。
+# - 返回 {"statusCode": 1, "tools": [{"id": "<文件名>", "config": {...}}]}
+@blueprint.route("/amcp/manifest", methods=["GET", "OPTIONS"])
+def manifest():
+    if request.method == "OPTIONS":
         resp = jsonify({})
-        resp.headers.add("Access-Control-Allow-Origin", "*")
-        resp.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
-        resp.headers.add("Access-Control-Allow-Headers", "Content-Type")
-        return resp
-
-    config_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amcp_config_sample")
-    tools = []
-    try:
-        if os.path.isdir(config_dir):
-            for filename in sorted(os.listdir(config_dir)):
-                if not filename.endswith(".json"):
-                    continue
-                tool_id = filename[:-5]
-                try:
-                    with open(os.path.join(config_dir, filename), "r", encoding="utf-8") as f:
-                        config = json.load(f)
-                    tools.append({"id": tool_id, "config": config})
-                except Exception:
-                    # 单个坏文件不影响其他工具被列出
-                    continue
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    else:
+        base = ap.public_base_url()
+        tools = []
+        for filename in sorted(os.listdir(CONFIG_DIR)) if os.path.isdir(CONFIG_DIR) else []:
+            if not filename.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(CONFIG_DIR, filename), encoding="utf-8") as f:
+                    config = json.load(f)
+            except (OSError, ValueError):
+                log.warning("manifest: skipping unreadable config %s", filename)
+                continue  # 一个坏文件不影响别的工具
+            url = config.get("url")
+            if isinstance(url, str) and url.startswith("/"):
+                config["url"] = base + url
+            tools.append({"id": filename[:-len(".json")], "config": config})
         resp = jsonify({"statusCode": 1, "tools": tools})
-    except Exception as e:
-        resp = jsonify({"statusCode": 0, "message": f"Error: {str(e)}"})
-
-    resp.headers.add("Access-Control-Allow-Origin", "*")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 
-# 向特定服务器发送json
-def post_json(url, info, headers=None, timeout=30):
-    try:
-        default_headers = {"Content-Type": "application/json"}
-        if headers:
-            default_headers.update(headers)
-        response = requests.post(url, json=info, headers=default_headers, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        raise Exception(f"POST请求失败: {str(e)}")
+# ----------------------------------------------------------------
+# 同步调用:收参数、算、直接把结果返回给模型。
+#
+# - 平台最多等 30 秒,超时算失败。更久的活走下面的 /amcp/async。
+# - returnData 里的东西就是模型看到的全部。别把 args / params 原样回显:
+#   args 里有用户邮箱和一次性 token,params 里可能有密钥,回显就进了对话记录。
+@blueprint.route("/amcp/sync", methods=["POST"])
+@ap.amcp_tool
+def sync(params, args, tool_input):
+    sample_id = tool_input.get("sample_id")
+    sample_name = str(tool_input.get("sample_name") or "")
 
+    # 你的业务逻辑 ...
+
+    return ap.ok({
+        "sample_id": sample_id,
+        "sample_name_upper": sample_name.upper(),
+        "server_time": _now(),
+    })
 
 
 # ----------------------------------------------------------------
-# 接受来自agentplus的文件传输的sample
-@blueprint.route('/amcp/receive_file', methods=['POST'])
-def sample_receive_file():
-    data = request.get_json()
-    params = data["params"] # 在agentplus中设置的固定输入值
-    args = data["args"] # 来自agentplus的会话信息
-    input = data["input"] # agent的输入
-
-    # -------------------
-    # 接受一个文件的fileid
-    file_url = input["file_url"]
-    print(file_url)
-    # 你的逻辑代码,读取文件,进行操作等....
-    # .....
-    # -------------------
-
-    try:
-        # 返回成功响应和文件名
-        return jsonify({
-            "statusCode": 1, 
-            "returnData":{
-                "params":params,
-                "input":input,
-                "args":args
-            }
-        })
-    except Exception as e:
-        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+# 接收用户的文件。
+#
+# 模型传 fileid(聊天消息里 <FILES_ATTACHMENT> 块给出的那个),平台转发前把它换成
+# input.file_url。只有调用用户自己的文件才会换;别人的 fileid 平台直接拒,不会调到这里。
+# file_url 是能直接下载的地址。
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
+@blueprint.route("/amcp/receive_file", methods=["POST"])
+@ap.amcp_tool
+def receive_file(params, args, tool_input):
+    file_url = tool_input.get("file_url")
+    if not file_url:
+        return ap.fail("no file_url: pass the fileid shown in the chat's <FILES_ATTACHMENT> block")
 
+    # 示例:下载下来,报大小、类型和 sha256。真实服务在这里做你的处理。
+    digest, size = hashlib.sha256(), 0
+    with requests.get(file_url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type")
+        for chunk in r.iter_content(64 * 1024):
+            size += len(chunk)
+            if size > MAX_DOWNLOAD_BYTES:
+                return ap.fail(f"file is larger than {MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB")
+            digest.update(chunk)
 
+    return ap.ok({"size": size, "content_type": content_type, "sha256": digest.hexdigest()})
 
 
 # ----------------------------------------------------------------
-# 接受来自agentplus的普通调用
-@blueprint.route('/amcp/sync', methods=['POST'])
-def sample_sync():
+# 异步调用:先在聊天里建一张「进行中」卡片,马上返回;后台干完再把卡片改成 done / error。
+#
+# - 卡片只给用户看,不进模型上下文。模型这一轮拿到的只有下面 ok(...) 里那句话。
+# - update token 只能用一次,卡片只能改一次,所以那一次就写终态。
+# - token 24 小时后过期。
+# - 后台线程跑在 worker 进程里,进程重启时没干完的活会丢,卡片会一直停在「进行中」。
+#   正式服务请换成任务队列(RQ、Celery 等)。
+DEMO_IMAGE = ("https://upload.wikimedia.org/wikipedia/commons/thumb/d/db/"
+              "Alpaca_%2831562329701%29.jpg/1200px-Alpaca_%2831562329701%29.jpg")
 
-    data = request.get_json()
-    params = data["params"] # 在agentplus中设置的固定输入值
-    args = data["args"] # 来自agentplus的会话信息
-    input = data["input"] # agent的输入
 
-    # -------------------
-    # 你的代码...
+@blueprint.route("/amcp/async", methods=["POST"])
+@ap.amcp_tool
+def async_task(params, args, tool_input):
+    started = _now()
+    messageid = ap.create_card(args, title="Generating an image (example)",
+                               content="this takes a few seconds ...",
+                               tags={"started_time": started})
 
-    # -------------------
+    def work():
+        try:
+            time.sleep(SIMULATED_WORK_SECONDS)  # 你的耗时活
+            ap.finish_card(args, messageid, status="done", title="Image generated (example)",
+                           image_urls=[DEMO_IMAGE],
+                           tags={"started_time": started, "processed_time": _now()})
+        except Exception as e:
+            log.exception("async task failed")
+            _finish_with_error(args, messageid, "Image generation failed (example)", str(e))
 
+    threading.Thread(target=work, daemon=True).start()
+    return ap.ok({"message": "started; the result will appear as a card in the chat"})
+
+
+def _finish_with_error(args, messageid, title, error, tags=None):
+    """后台出错时把卡片翻成 error。如果之前那次 finish_card 已经送到平台,
+    token 就用掉了,这次会被拒;只记日志,别让后台线程再抛。"""
     try:
-        # 返回成功响应和文件名
-        return jsonify({
-            "statusCode": 1, 
-            "returnData":{
-                "params":params,
-                "input":input,
-                "args":args
-            }
-        })
-    except Exception as e:
-        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
-
-
-
+        ap.finish_card(args, messageid, status="error", title=title,
+                       error_message=error, tags=tags)
+    except Exception:
+        log.exception("could not mark card %s as error", messageid)
 
 
 # ----------------------------------------------------------------
-# 把一个文件一次性写进【调用用户】的 temp 缓存区(落在 amcp/outer/ 下)。
+# 写一个文件进调用用户的 temp,落在 amcp/outer/<path>,用户在 /cms/temp 能看到、下载。
+# 如果 agent 的沙盒开了 mount_user_temp,沙盒里 /cache/amcp/outer/... 也能读到。
 #
-# 用 args 里自带的一次性 token: write_temp_file_token
-#   - 文件最终路径: 用户文件夹/amcp/outer/<你决定的 path>
-#     path 可含多级子目录(如 "reports/2026/out.json"),后端逐段做白名单校验,
-#     '..' 之类的穿越会被拒。
-#   - 用户能在 /cms/temp 页面看到 / 下载; 若该 agent 开了沙盒 mount_user_temp,
-#     沙盒里 /cache/amcp/outer/... 也能读到。
-#   - 内容用 base64 编码提交。限制: 单文件 <=100MB,且不超用户 temp 总配额(1GB)。
-#   - 一次性: 该 token 用一次即失效,一次出站只能写一个文件。
-#   - 安全: 不要传 userid / chatid —— 后端从 token 反查,防止越权写到别人的 temp。
-@blueprint.route('/amcp/write_temp_file', methods=['POST'])
-def sample_write_temp_file():
-    import base64
+# - path 由你决定,可以带子目录;平台逐段校验,".." 之类会被拒。
+# - 不用传 userid / chatid:平台从 token 反查用户,你也就写不到别人那里。
+@blueprint.route("/amcp/write_temp_file", methods=["POST"])
+@ap.amcp_tool
+def write_temp_file(params, args, tool_input):
+    path = tool_input.get("path") or "amcp_demo.txt"
+    content = tool_input.get("content") or "hello from external amcp"
 
-    data = request.get_json()
-    params = data["params"]   # 在agentplus中设置的固定输入值
-    args = data["args"]       # 来自agentplus的会话信息(含一次性 token)
-    input = data["input"]     # agent的输入
-
-    try:
-        token = args.get("write_temp_file_token")
-        if not token:
-            return jsonify({"statusCode": 0, "message": "missing write_temp_file_token"}), 400
-
-        # LLM 决定的相对路径 + 内容(实际可换成你服务生成的任意文件字节)
-        path = input.get("path") or "amcp_demo.txt"
-        content = input.get("content") or "hello from external amcp"
-        data_bytes = content.encode("utf-8")
-
-        # 提交到 agentplus: 文件会落在 用户文件夹/amcp/outer/<path>
-        url = f"{AGENTPLUS_BASE_URL}/back/api/write_temp_file"
-        info = {
-            "token": token,
-            "path": path,                                              # 由外部 AMCP 决定
-            "content_base64": base64.b64encode(data_bytes).decode("ascii"),
-        }
-        # resp 形如 {"statusCode":1,"returnData":{"relpath":"amcp/outer/<path>","size":N}}
-        # 失败 statusCode: 8=token无效或已用 / 400=参数错 / 413=超配额或文件过大
-        resp = post_json(url, info)
-
-        return jsonify({
-            "statusCode": 1,
-            "returnData": {
-                "write_result": resp,
-                "input": input
-            }
-        })
-    except Exception as e:
-        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+    saved = ap.write_temp_file(args, path, content.encode("utf-8"))
+    return ap.ok({"saved": saved, "where": "the user's temp files (/cms/temp)"})
 
 
 # ----------------------------------------------------------------
-# 把一个文件一次性写进【调用用户】的结构化笔记本(struct)指定页,作为一个 file block 落地。
+# 写一个文件进调用用户的笔记本,作为一个文件块。
 #
-# 用 args 里【按需下发】的一次性 token: write_struct_file_token
-#   —— 与 write_temp_file_token 的关键差异: 这是【细粒度授权】。
-#      该 token 只在「发起本次调用的那个 LLM block 此刻确实有 struct 写权限」
-#      (在 agentplus 里勾了 accessStructs 且允许新增 block)时才会出现在 args 里。
-#      所以代码里必须先判断它在不在 —— 不在就说明本块没被授予笔记本写权限。
-#
-#   - 文件落地形态: 笔记本某页上新建一个 file block,字节上传云存储后出公开 URL。
-#   - 作用域被冻结: 后端只允许写进该 block 被授权的笔记本范围(root_page + editable_path)。
-#     不传 pageid → 默认写进该笔记本根页; 传了别的笔记本 / 越界的 pageid 一律被拒(403)。
-#   - 内容用 base64 编码提交。限制: 单文件 <=100MB。
-#   - 一次性: 该 token 用一次即失效,一次出站只能写一个文件。
-#   - 安全: 不要传 userid / chatid —— 后端从 token 反查,防止越权写到别人的笔记本。
-@blueprint.route('/amcp/write_struct_file', methods=['POST'])
-def sample_write_struct_file():
-    import base64
+# 跟 write_temp_file 的区别:这个 token 是按需发的。只有发起调用的 agent 此刻能往笔记本里
+# 加块(开了 accessStructs 且允许新增块)时,args 里才有 write_struct_file_token;
+# 而且它被锁在那本笔记本的可写范围里,越界的 pageid 一律 403。
+@blueprint.route("/amcp/write_struct_file", methods=["POST"])
+@ap.amcp_tool
+def write_struct_file(params, args, tool_input):
+    if not ap.has_struct_write(args):
+        return ap.fail(ap.NO_STRUCT_WRITE)
 
-    data = request.get_json()
-    params = data["params"]   # 在agentplus中设置的固定输入值
-    args = data["args"]       # 来自agentplus的会话信息(struct 写 token 按需下发)
-    input = data["input"]     # agent的输入
-
-    try:
-        # 按需下发: 发起块没勾 accessStructs 写权限时,args 里【不会】有这个 token
-        token = args.get("write_struct_file_token")
-        if not token:
-            return jsonify({
-                "statusCode": 0,
-                "message": "no write_struct_file_token in args: the calling block has no notebook(struct) write permission. "
-                           "Enable 'accessStructs' (allow add block) on this block in agentplus."
-            }), 400
-
-        # LLM 决定的文件名 + 内容(实际可换成你服务生成的任意文件字节)
-        filename = input.get("filename") or "amcp_demo.txt"
-        content = input.get("content") or "hello from external amcp (struct file)"
-        data_bytes = content.encode("utf-8")
-
-        # 提交到 agentplus: 文件作为 file block 写进笔记本页
-        url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file"
-        info = {
-            "token": token,
-            "filename": filename,
-            "content_base64": base64.b64encode(data_bytes).decode("ascii"),
-            # 可选: 不传则默认写进该笔记本根页; 传了必须落在 token 冻结的作用域内,否则 403
-            # "pageid": input.get("pageid"),
-            # 可选: block 在页内的顺序; 不传则追加到页尾
-            # "block_order_index": input.get("block_order_index"),
-        }
-        # resp 形如 {"statusCode":1,"returnData":{"contentid":N,"pageid":N,"file_url":"...","filename":"..."}}
-        # 失败 statusCode: 8=token无效或已用 / 400=参数错 / 403=目标页越出作用域 / 413=文件过大
-        resp = post_json(url, info)
-
-        return jsonify({
-            "statusCode": 1,
-            "returnData": {
-                "write_result": resp,
-                "input": input
-            }
-        })
-    except Exception as e:
-        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+    filename = tool_input.get("filename") or "amcp_demo.txt"
+    content = tool_input.get("content") or "hello from external amcp (notebook file)"
+    saved = ap.write_struct_file(args, filename, content.encode("utf-8"),
+                                 pageid=tool_input.get("pageid"))
+    return ap.ok({"saved": saved})
 
 
 # ----------------------------------------------------------------
-# 【进阶案例】异步生成 + 写进笔记本【指定页】,并演示「不消费 token 的 pageid 预检」。
+# 进阶:异步生成,写进笔记本里指定的那一页。ComfyUI 异步出图就是这个流程。
 #
-# 这是把前面几块拼起来的真实范式(ComfyUI 异步出图就是这么做的):
-#   (1) pageid 预检(fail-fast): 在做任何昂贵动作【之前】,先用一次【不消费 token】的
-#       调用确认目标 pageid 落在 token 冻结的笔记本作用域内 —— 越权立刻返回,绝不白跑
-#       后面的耗时任务。预检走 /back/api/write_struct_file/precheck,它【不会】消耗那个
-#       一次性的 write_struct_file_token(只读、可反复查)。
-#   (2) create_async_message: 先在聊天里建一张 running 卡片。
-#   (3) 后台线程做耗时活(这里 sleep 模拟),生成文件字节。
-#   (4) write_struct_file: 把文件写进【那一页】(带 pageid)。token 在这一步【才被消费】。
-#   (5) 卡片终态由写入结果决定: 成功→done(用 AP 回的公开 file_url); 若该页在预检之后
-#       被删/移走导致越权(403, TOCTOU)→ error,且仍把已生成的产物信息给出,避免成果丢失。
+#   (1) 预检 pageid:不消费 token,越界马上返回,不白跑后面的耗时活
+#   (2) 建一张「进行中」卡片
+#   (3) 后台干活,生成文件
+#   (4) 写进那一页,token 这时才被消费
+#   (5) 卡片终态看写入结果。预检之后那一页被删或移走的话,写入会被拒;
+#       卡片翻成 error,并把已生成的东西说清楚,别让成果悄悄丢了。
 #
-# 为什么要预检? write_struct_file_token 是【一次性写】(写一次即焚),不能"先试写一下看行
-# 不行"。预检端点把「查作用域」和「那一次写」拆开 —— 查 scope 是只读、幂等的,不该消耗那次
-# 写。任何外部 AMCP 在跑昂贵任务前都能复用这个预检来 fail-fast。
-@blueprint.route('/amcp/async_generate_to_struct', methods=['POST'])
-def sample_async_generate_to_struct():
-    import base64
+# 为什么要预检:写笔记本的 token 只能用一次,没法「先试写一下」。
+# 预检把「查范围」和「那一次写」分开,查范围只读,可以反复问。
+@blueprint.route("/amcp/async_generate_to_struct", methods=["POST"])
+@ap.amcp_tool
+def async_generate_to_struct(params, args, tool_input):
+    if not ap.has_struct_write(args):
+        return ap.fail(ap.NO_STRUCT_WRITE)
+    pageid = tool_input.get("pageid")
+    if pageid is None:
+        return ap.fail("missing pageid: use the accessStructs tool to find or create the target page")
 
-    data = request.get_json()
-    params = data["params"]   # 在agentplus中设置的固定输入值
-    args = data["args"]       # 来自agentplus的会话信息(struct 写 token 按需下发)
-    input = data["input"]     # agent的输入
+    ap.precheck_struct_page(args, pageid)  # (1) 越界会抛 AgentPlusError,模型会看到原因
 
-    started_time = time.strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        # 按需下发的一次性写 token; 不在 = 本块没被授予笔记本写权限
-        struct_token = args.get("write_struct_file_token")
-        if not struct_token:
-            return jsonify({
-                "statusCode": 0,
-                "message": "no write_struct_file_token in args: the calling block has no notebook(struct) write permission. "
-                           "Enable 'accessStructs' (allow add block) on this block in agentplus."
-            }), 400
+    started = _now()
+    messageid = ap.create_card(args, title="Generating, then filing into the notebook ...",  # (2)
+                               content=f"target page: {pageid}",
+                               tags={"started_time": started, "pageid": pageid})
+    filename = tool_input.get("filename") or "amcp_demo.txt"
+    content = tool_input.get("content") or "hello from external amcp (async → notebook page)"
 
-        # 本案例写进【指定页】,所以要求 agent 传 pageid(用 accessStructs 工具浏览拿到)
-        pageid = input.get("pageid")
-        if pageid is None:
-            return jsonify({
-                "statusCode": 0,
-                "message": "missing input.pageid: use the accessStructs tool to pick a target page id."
-            }), 400
-
-        # ---- (1) pageid 预检: 不消费 token,越权 fail-fast,不白跑后面的耗时活 ----
-        precheck_url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file/precheck"
-        # 预检请求体只要 {token, pageid}; 不传 pageid 则按"默认根页"判定。
-        # 返回 {"statusCode":1,"returnData":{"in_scope":true,...}} = 在范围内;
-        #      越权 {"statusCode":403,"returnData":"<原因>"} / token 失效 {"statusCode":8}
-        pre = post_json(precheck_url, {"token": struct_token, "pageid": pageid})
-        if pre.get("statusCode") != 1:
-            return jsonify({
-                "statusCode": 0,
-                "message": f"pageid precheck failed: {pre.get('returnData')}",
-                "returnData": pre,
-            }), 400
-
-        # ---- (2) 建一张 running 卡片 ----
-        create_url = f"{AGENTPLUS_BASE_URL}/back/api/create_async_message"
-        created = post_json(create_url, {
-            "chatid": args["chatid"],
-            "token": args["create_async_message_token"],
-            "params": {
-                "title": "Generating + filing into notebook...",
-                "content": f"target pageid: {pageid}",
-                "status": "running",
-                "image_urls": [],
-                "additional_tags": {"started_time": started_time, "pageid": pageid},
-            },
-        })
-        messageid = created["returnData"]["messageid"]
-
-        # ---- (3)+(4)+(5) 后台: 耗时活 → 写指定页 → 卡片终态由写入结果决定 ----
-        def worker(messageid, args, input, struct_token, pageid):
-            update_url = f"{AGENTPLUS_BASE_URL}/back/api/update_async_message"
+    def work():
+        try:
+            time.sleep(SIMULATED_WORK_SECONDS)  # (3) 你的耗时活
+            data = content.encode("utf-8")
             try:
-                # 你的耗时活(出图/渲染/转码...)。这里用 sleep + 一段文本模拟产物。
-                time.sleep(3)
-                filename = input.get("filename") or "amcp_demo.txt"
-                content = input.get("content") or "hello from external amcp (async -> struct)"
-                file_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                saved = ap.write_struct_file(args, filename, data, pageid=pageid)  # (4)
+            except ap.AgentPlusError as e:
+                _finish_with_error(args, messageid, "Generated, but not filed into the notebook",
+                                   f"{filename} ({len(data)} bytes) was generated, but the write "
+                                   f"was rejected: {e.detail}", tags={"pageid": pageid})
+                return
+            ap.finish_card(args, messageid, status="done", title="Done: filed into the notebook",  # (5)
+                           content=saved.get("filename") or filename,
+                           tags={"started_time": started, "processed_time": _now(),
+                                 "pageid": saved.get("pageid"), "contentid": saved.get("contentid")})
+        except Exception as e:
+            log.exception("async_generate_to_struct failed")
+            _finish_with_error(args, messageid, "Failed", str(e), tags={"pageid": pageid})
 
-                # 写进【那一页】。token 在这一步【才被消费】(一次性)。
-                write_url = f"{AGENTPLUS_BASE_URL}/back/api/write_struct_file"
-                wr = post_json(write_url, {
-                    "token": struct_token,
-                    "filename": filename,
-                    "content_base64": file_b64,
-                    "pageid": pageid,
-                })
-                rd = (wr or {}).get("returnData") or {}
-
-                if wr.get("statusCode") == 1:
-                    # 成功 → done,用 AP 回的公开 file_url 展示
-                    post_json(update_url, {
-                        "messageid": messageid,
-                        "token": args["update_async_message_token"],
-                        "params": {
-                            "title": "Done - filed into notebook",
-                            "content": "",
-                            "status": "done",
-                            "image_urls": [rd.get("file_url")] if rd.get("file_url") else [],
-                            "additional_tags": {
-                                "started_time": started_time,
-                                "processed_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                "pageid": rd.get("pageid"),
-                                "contentid": rd.get("contentid"),
-                            },
-                        },
-                    })
-                else:
-                    # 极少数 TOCTOU: 预检通过后该页被删/移走 → 写时才 403(或 token 被抢用=8)。
-                    # 卡片翻 error,但仍把产物信息给出,避免成果丢失。
-                    post_json(update_url, {
-                        "messageid": messageid,
-                        "token": args["update_async_message_token"],
-                        "params": {
-                            "title": "Generated, but NOT filed (pageid rejected)",
-                            "content": f"write_struct_file rejected: statusCode={wr.get('statusCode')}, {wr.get('returnData')}",
-                            "status": "error",
-                            "additional_tags": {"pageid": pageid, "error": str(wr.get("returnData"))},
-                        },
-                    })
-            except Exception as e:
-                post_json(update_url, {
-                    "messageid": messageid,
-                    "token": args["update_async_message_token"],
-                    "params": {"title": "Failed", "status": "error", "content": f"error: {str(e)}"},
-                })
-
-        t = threading.Thread(target=worker, args=(messageid, args, input, struct_token, pageid))
-        t.daemon = True   # 守护线程,主线程结束时自动结束
-        t.start()
-
-        # 立刻返回"已开始"回执(异步: 图/文件完成后由后台线程回写卡片)
-        return jsonify({
-            "statusCode": 1,
-            "returnData": {"message": "started; will file the result into the chosen notebook page when done."}
-        })
-    except Exception as e:
-        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
+    threading.Thread(target=work, daemon=True).start()
+    return ap.ok({"message": "started; the file will be added to the chosen notebook page when done"})
 
 
 # ----------------------------------------------------------------
-# 接受来自agentplus的异步调用sample用法
-@blueprint.route('/amcp/async', methods=['POST'])
-def sample_async():
-
-    data = request.get_json()
-    params = data["params"] # 在agentplus中设置的固定输入值
-    args = data["args"] # 来自agentplus的会话信息
-    input = data["input"] # agent的输入
-
-    
-    started_time = time.strftime("%Y-%m-%d %H:%M:%S")
+# 把图片传回聊天:同步返回的 returnData 里放 __images__。
+#
+#   returnData = {...你的字段..., "__images__": [{"data": "<base64>", "name": "...", "caption": "..."}]}
+#
+# 平台收到后:
+# - 校验格式(只收 PNG / JPEG / GIF / WebP)和大小,统一转成各家模型都收的尺寸;
+# - 存进这个聊天,聊天里出一条图片消息,用户看得到;
+# - 调用方的模型能看图的话,图进上下文,模型这一轮就能看到;
+# - __images__ 本身会从模型看到的结果里拿掉,换成一段摘要。
+# 限制:一次最多 8 张,单张 10MB 以内,合计 20MB 以内。
+#
+# 一定先看 ap.can_return_images(args)。旧版 AgentPlus 不认 __images__,
+# 会把几 MB 的 base64 当文本塞给模型。
+@blueprint.route("/amcp/return_image", methods=["POST"])
+@ap.amcp_tool
+def return_image(params, args, tool_input):
+    values = tool_input.get("values") or [3, 7, 2, 9, 4]
+    if isinstance(values, str):
+        values = values.replace(",", " ").split()
     try:
-        # -----------------------------------------
-        # post a async message
-        url = f"{AGENTPLUS_BASE_URL}/back/api/create_async_message"
-        info = {
-            "chatid":args["chatid"],
-            "token":args["create_async_message_token"],
-            "params":{
-                "title":"Generating some images(for example)",
-                "content":"description here ...",
-                "status":"running",
-                "image_urls":[],
-                "additional_tags":{
-                    "started_time": started_time
-                    # any infomation you need ...
-                }
-            }
-        }
-        result = post_json(url, info)
-        messageid = result["returnData"]["messageid"]
-        # 获取messageid
-        # 根据messageid修改刚才的信息
-        # -------------------------------------------------------------------------
+        numbers = [float(x) for x in values]
+    except (TypeError, ValueError):
+        return ap.fail("values must be a list of numbers, e.g. [3, 7, 2]")
+    # 跟图保持一致:负数画成 0,inf / nan 跳过,最多 24 根柱子;说明文字也按这一份数写
+    values = [max(0.0, v) for v in numbers if math.isfinite(v)][:24]
 
-        def async_task(messageid, args, input):
-            update_url = f"{AGENTPLUS_BASE_URL}/back/api/update_async_message"
-            try:
-                # 异步处理逻辑
-                # ----------------------------
-                # 一些逻辑代码...
-                time.sleep(3)
+    result = {
+        "message": f"bar chart of {len(values)} values generated",
+        # 调用方模型此刻能不能看图。看不见时图照样显示给用户;只有「取图就是为了给模型看」
+        # 的场景,才值得据此省掉生成或下载。
+        "vision_enabled": args.get("vision_enabled"),
+    }
+    if not ap.can_return_images(args):
+        result["note"] = "this AgentPlus does not accept returned images, so the chart was not sent"
+        return ap.ok(result)
 
-                # ----------------------------
-                update_info = {
-                    "messageid": messageid,
-                    "token": args["update_async_message_token"],
-                    "params": {
-                        "title":"Images generated!(for example)",
-                        "content": "description here ...",
-                        "status": "done",
-                        "image_urls":["https://upload.wikimedia.org/wikipedia/commons/thumb/d/db/Alpaca_%2831562329701%29.jpg/1200px-Alpaca_%2831562329701%29.jpg"],
-                        "additional_tags": {
-                            "started_time": started_time,
-                            "processed_time": time.strftime("%Y-%m-%d %H:%M:%S")
-                            # any infomation you need ...
-                        }
-                    }
-                }
-                # 处理完成后，更新消息状态
-                post_json(update_url, update_info)
+    result["__images__"] = [ap.image_item(
+        _bar_chart_png(values), name="bar_chart.png",
+        caption="bar chart of: " + ", ".join(f"{v:g}" for v in values))]
+    return ap.ok(result)
 
 
-            except Exception as e:
-                # 处理失败时，更新消息状态为失败
-                error_info = {
-                    "messageid": messageid,
-                    "token": args["update_async_message_token"],
-                    "params": {
-                        "title":"Images generation failed!(for example)",
-                        "status": "error",
-                        "content": f"error message: {str(e)}",
-                        "additional_tags": {
-                            "error": str(e)
-                        }
-                    }
-                }
-                post_json(update_url, error_info)
+def _bar_chart_png(values, width=480, height=240):
+    """只用标准库画一张柱状图(不带文字),代表「服务端生成的图」。"""
+    values = values or [1.0]
+    top = max(values) or 1.0
+    n, pad = len(values), 16
+    slot = (width - 2 * pad) / n
+    gap = max(2, int(slot * 0.2))
+    heights = [int((height - 2 * pad) * v / top) for v in values]
+    bg, bar, axis = b"\xff\xff\xff", b"\x25\x63\xeb", b"\xa0\xa0\xa0"
+    rows = []
+    for y in range(height):
+        row = bytearray(b"\x00")  # 每行开头的 0 = PNG filter type None
+        for x in range(width):
+            color = bg
+            if y == height - pad and pad <= x < width - pad:
+                color = axis
+            elif pad <= x < width - pad and y < height - pad:
+                i = int((x - pad) // slot)
+                if i < n and (x - pad) - i * slot < slot - gap and y >= height - pad - heights[i]:
+                    color = bar
+            row += color
+        rows.append(bytes(row))
 
-        # 启动异步任务
-        thread = threading.Thread(target=async_task, args=(messageid, args, input))
-        thread.daemon = True  # 设置为守护线程，主线程结束时会自动结束
-        thread.start()
-        # -------------------------------------------------------------------------
+    def chunk(tag, body):
+        return (struct.pack(">I", len(body)) + tag + body
+                + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
 
-        # 返回成功响应,此处的信息将会直接传递给下一个block,
-        return jsonify({
-            "statusCode": 1, 
-            "returnData":{
-                "message":"Image generation started!(for example)"
-            }
-        })
-    except Exception as e:
-        return jsonify({"statusCode": 0, "message": f"Error: {str(e)}"}), 500
-
-
-
-
-
-
-
-
-
-
-
-
-
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))

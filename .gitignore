@@ -12,3 +12,6 @@ venv/
 
 # --- logs ---
 *.log
+
+# --- gunicorn 25+ 运行时的控制 socket ---
+gunicorn.ctl

@@ -1,0 +1,29 @@
+{
+  "url": "/amcp/return_image",
+  "function": {
+    "name": "test_return_image",
+    "description": "把一组数字画成柱状图,图会出现在聊天里;如果当前模型能看图,你在工具结果之后也能直接看到它。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "要画的数字,最多 24 个,如 [3, 7, 2, 9, 4]"
+        }
+      },
+      "required": [
+        "values"
+      ]
+    }
+  },
+  "frontend": {
+    "title": "test return image",
+    "tips": "a sample tool that returns an image to the chat (returnData.__images__); vision models see it too."
+  },
+  "params": {
+    "amcp_secret": ""
+  }
+}

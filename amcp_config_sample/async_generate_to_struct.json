@@ -1,14 +1,14 @@
 {
-  "url": "http://1.2.3.4:3400/amcp/async_generate_to_struct",
-  "function":{
+  "url": "/amcp/async_generate_to_struct",
+  "function": {
     "name": "test_async_generate_to_struct",
-    "description": "进阶案例:异步生成一个文件并写进当前用户笔记本(struct)的【指定页】。会先用一次【不消费 token】的预检确认 pageid 在授权范围内(越权立刻报错、不白跑后面的耗时活),再后台生成、写入,并把聊天卡片更新为 done / error。需在本块开启 accessStructs(允许新增 block)写权限,否则后端不会下发写 token。",
+    "description": "进阶示例:后台生成一个文件,写进当前用户笔记本里指定的那一页。开始前会先确认这一页可写,不可写马上报错;完成后聊天里的卡片变成 done 或 error。需要本 agent 有笔记本写权限(accessStructs 允许新增块)。",
     "parameters": {
       "type": "object",
       "properties": {
         "pageid": {
           "type": "integer",
-          "description": "目标页 id(必填)。用 accessStructs 工具浏览/新建目标页拿到;必须属于被授权的笔记本且落在可写路径内,否则预检直接拒(403)。"
+          "description": "目标页 id,用 accessStructs 工具查到或新建。必须在可写范围内。"
         },
         "filename": {
           "type": "string",
@@ -16,15 +16,19 @@
         },
         "content": {
           "type": "string",
-          "description": "要写入文件的文本内容"
+          "description": "文件的文本内容"
         }
       },
-      "required": ["pageid"]
+      "required": [
+        "pageid"
+      ]
     }
   },
-  "frontend":{
-    "title":"test async generate to notebook page",
-    "tips":"a sample amcp: async-generate a file and file it into a CHOSEN notebook page, with a non-consuming pageid precheck (fail-fast) before the expensive work. requires this block's accessStructs write permission."
+  "frontend": {
+    "title": "test async to notebook page",
+    "tips": "advanced sample: checks the target notebook page first, generates in the background, then files the result into that page."
   },
-  "params": {}
+  "params": {
+    "amcp_secret": ""
+  }
 }

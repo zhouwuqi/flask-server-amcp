@@ -1,5 +1,5 @@
-flask
-dotenv
-requests
-gevent
-gunicorn
+flask>=2.2
+python-dotenv>=1.0
+requests>=2.28
+gevent>=22.10
+gunicorn>=21.2
